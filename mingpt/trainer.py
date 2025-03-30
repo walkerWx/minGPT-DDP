@@ -1,109 +1,109 @@
-"""
-Simple training loop; Boilerplate that could apply to any arbitrary neural network,
-so nothing in this file really has anything to do with GPT specifically.
-"""
-
-import time
-from collections import defaultdict
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
 import torch
-from torch.utils.data.dataloader import DataLoader
-from mingpt.utils import CfgNode as CN
+from collections import OrderedDict
+import os
+
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+@dataclass
+class TrainerConfig:
+    max_epochs: int = None
+    batch_size: int = None
+    data_loader_workers: int = None
+    grad_norm_clip: float = None
+    snapshot_path: Optional[str] = None
+    save_every: int = None
+    use_amp: bool = False
+
+
 
 class Trainer:
 
-    @staticmethod
-    def get_default_config():
-        C = CN()
-        # device to train on
-        C.device = 'auto'
-        # dataloder parameters
-        C.num_workers = 4
-        # optimizer parameters
-        C.max_iters = None
-        C.batch_size = 64
-        C.learning_rate = 3e-4
-        C.betas = (0.9, 0.95)
-        C.weight_decay = 0.1 # only applied on matmul weights
-        C.grad_norm_clip = 1.0
-        return C
+    def __init__(self, trainer_config: TrainerConfig, model, optimizer, train_dataset, test_dataset=None):
+        self.config = trainer_config
+        self.local_rank = int(os.environ.get('LOCAL_RANK'))
+        self.global_rank = int(os.environ.get('RANK'))
 
-    def __init__(self, config, model, train_dataset):
-        self.config = config
-        self.model = model
-        self.optimizer = None
         self.train_dataset = train_dataset
-        self.callbacks = defaultdict(list)
+        self.train_loader = self._prepare_dataloader(self.train_dataset)
+        self.test_loader = self._prepare_dataloader(test_dataset) if test_dataset else None
 
-        # determine the device we'll train on
-        if config.device == 'auto':
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        else:
-            self.device = config.device
-        self.model = self.model.to(self.device)
-        print("running on device", self.device)
+        self.epochs_run = 0
+        self.model = model.to(self.local_rank)
+        self.optimizer = optimizer
+        self.save_every = self.config.save_every
 
-        # variables that will be assigned to trainer class later for logging and etc
-        self.iter_num = 0
-        self.iter_time = 0.0
-        self.iter_dt = 0.0
+        if self.config.snapshot_path is None:
+            self.config.snapshot_path = "snapshot.pth"
+        
+        self._load_snapshot()
 
-    def add_callback(self, onevent: str, callback):
-        self.callbacks[onevent].append(callback)
-
-    def set_callback(self, onevent: str, callback):
-        self.callbacks[onevent] = [callback]
-
-    def trigger_callbacks(self, onevent: str):
-        for callback in self.callbacks.get(onevent, []):
-            callback(self)
-
-    def run(self):
-        model, config = self.model, self.config
-
-        # setup the optimizer
-        self.optimizer = model.configure_optimizers(config)
-
-        # setup the dataloader
-        train_loader = DataLoader(
-            self.train_dataset,
-            sampler=torch.utils.data.RandomSampler(self.train_dataset, replacement=True, num_samples=int(1e10)),
-            shuffle=False,
+        self.model = DDP(self.model, device_ids=[self.local_rank])
+        
+    
+    
+    def _prepare_dataloader(self, dataset):
+        return DataLoader(
+            dataset, 
+            batch_size=self.config.batch_size,
+            num_workers=self.config.data_loader_workers,
             pin_memory=True,
-            batch_size=config.batch_size,
-            num_workers=config.num_workers,
+            shuffle=False,
+            sampler=DistributedSampler(dataset),
         )
 
-        model.train()
-        self.iter_num = 0
-        self.iter_time = time.time()
-        data_iter = iter(train_loader)
-        while True:
 
-            # fetch the next batch (x, y) and re-init iterator if needed
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_loader)
-                batch = next(data_iter)
-            batch = [t.to(self.device) for t in batch]
-            x, y = batch
+    def _load_snapshot(self):
+        if os.path.exists(self.config.snapshot_path):
+            snapshot = torch.load(self.config.snapshot_path)
+            self.model.load_state_dict(snapshot.model_state)
+            self.optimizer.load_state_dict(snapshot.optimizer_state)
+            self.epochs_run = snapshot.finished_epoch
+            print(f"Resuming training from epoch {self.epochs_run}")
+            
 
-            # forward the model
-            logits, self.loss = model(x, y)
-
-            # backprop and update the parameters
-            model.zero_grad(set_to_none=True)
-            self.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+    def _run_batch(self, source, targets, train: bool = True) -> float:
+        with torch.set_grad_enabled(train), torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(self.config.use_amp)):
+            _, loss = self.model(source, targets)
+        
+        if train:
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_norm_clip)
             self.optimizer.step()
+        
+        return loss.item()
+    
+    def _run_epoch(self, epoch: int, data_loader: DataLoader, train: bool = True):
+        data_loader.sampler.set_epoch(epoch)
+        for iter, (source, targets) in enumerate(data_loader):
+            step_type = "Train" if train else "Eval"
+            source = source.to(self.local_rank)
+            targets = targets.to(self.local_rank)
+            batch_loss = self._run_batch(source, targets, train)
+            if iter % 100 == 0:
+                print(f"[GPU{self.global_rank}] Epoch {epoch} | Iter {iter} | {step_type} Loss: {batch_loss:.5f}")
 
-            self.trigger_callbacks('on_batch_end')
-            self.iter_num += 1
-            tnow = time.time()
-            self.iter_dt = tnow - self.iter_time
-            self.iter_time = tnow
-
-            # termination conditions
-            if config.max_iters is not None and self.iter_num >= config.max_iters:
-                break
+    def _save_snapshot(self, epoch):
+        model = self.model 
+        raw_model = model.module if hasattr(model, "module") else model
+        snapshot = {
+            "model_state": raw_model.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "finished_epoch": epoch,
+        }
+        torch.save(snapshot, self.config.snapshot_path)
+        print(f"Snapshot saved to at epoch {epoch} at {self.config.snapshot_path}")
+    
+    def train(self):
+        for epoch in range(self.epochs_run, self.config.max_epochs):
+            epoch = epoch + 1
+            self._run_epoch(epoch, self.train_loader, train=True)
+            if self.local_rank == 0 and epoch % self.save_every == 0:
+                self._save_snapshot(epoch)
+            if self.test_loader is not None:
+                self._run_epoch(epoch, self.test_loader, train=False)
